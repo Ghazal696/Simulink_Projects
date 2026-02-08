@@ -1,7 +1,7 @@
 # EV Torque Control System (Simulink / Stateflow)
 
 This project implements a simplified Electric Vehicle (EV) torque control system
-using MATLAB Simulink and Stateflow. The focus is on clean architecture, control
+using MATLAB Simulink and Stateflow (R2026a version). The focus is on clean architecture, control
 logic clarity, and ASIL-style safety separation rather than production-level
 complexity.
 
