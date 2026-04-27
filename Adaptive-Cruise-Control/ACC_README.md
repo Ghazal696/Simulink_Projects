@@ -3,7 +3,7 @@
 **Author:** Ghazal Ghorbani  
 **Tools:** MATLAB, Simulink, Stateflow, Embedded Coder, Simulink Test  
 **Domain:** Automotive ADAS — Longitudinal Control  
-**Status:** 🟡 In Progress — Phase 3 Complete
+**Status:** 🟡 In Progress — Phase 4 Complete
 
 ---
 
@@ -27,8 +27,8 @@ This project demonstrates the full MBD workflow: plant modelling → sensor mode
 │  └──────────────┘    └──────┬───────┘                  │
 │         ▲                   │ d_rel_meas               │
 │         │ a_demand          │ delta_v_meas             │
-│         │            ┌──────▼───────┐                  │
-│         │            │ACC_Controller│                  │
+│  [Unit  │            ┌──────▼───────┐                  │
+│  Delay] │            │ACC_Controller│                  │
 │         └────────────│ (Phase 3+4) │                  │
 │                      └──────────────┘                  │
 └─────────────────────────────────────────────────────────┘
@@ -43,8 +43,8 @@ ACC_Simulink_Project/
 ├── ACC_Plant.slx           ← Phase 1: Vehicle plant model
 ├── ACC_Sensor.slx          ← Phase 2: Radar sensor model
 ├── ACC_Controller.slx      ← Phase 3: Stateflow state machine
-├── ACC_PID.slx             ← Phase 4: PID controller (pending)
-├── ACC_System.slx          ← Full integrated system (pending)
+├── ACC_PID_Controller.slx  ← Phase 4: PID controller
+├── ACC_System.slx          ← Full integrated system
 ├── docs/
 │   ├── requirements.md     ← System requirements
 │   └── test_report.pdf     ← Phase 6 test results
@@ -60,7 +60,7 @@ ACC_Simulink_Project/
 | 1 | Vehicle Plant Model | Simulink | ✅ Complete |
 | 2 | Radar Sensor Model | Simulink | ✅ Complete |
 | 3 | ACC State Machine | Stateflow | ✅ Complete |
-| 4 | Controller Design (PID) | Simulink | ⬜ Pending |
+| 4 | Controller Design (PID) | Simulink | ✅ Complete |
 | 5 | C Code Generation & SIL | Embedded Coder | ⬜ Pending |
 | 6 | Test Scenarios & Report | Simulink Test | ⬜ Pending |
 
@@ -196,8 +196,8 @@ ACC_Plant (ground truth)     ACC_Sensor (noisy measured)     ACC_Controller
 **Sanity test:** Connect Phase 1 plant outputs directly. Run 10 s simulation with ego coasting.
 
 **Expected scope behaviour:**
-- `d_rel_meas` (yellow): decreases from ~50 m to ~0 m with tight ±0.3 m noise jitter ✅
-- `delta_v_meas` (blue): flat line at ~−5 m/s with tight ±0.1 m/s noise jitter ✅
+- `d_rel_meas`: decreases from ~50 m to ~0 m with tight ±0.3 m noise jitter ✅
+- `delta_v_meas`: flat line at ~−5 m/s with tight ±0.1 m/s noise jitter ✅
 - Overall trend follows ground truth closely — noise visible but not dominant ✅
 
 ---
@@ -242,7 +242,7 @@ This is the decision-making brain of the system — it answers the question: *"W
 #### Transition Table
 
 | From | To | Condition |
-|------|----|-----------|
+|------|----|-----------| 
 | `OFF` | `STANDBY` | `[ACC_enable == 1]` |
 | `STANDBY` | `OFF` | `[ACC_enable == 0]` |
 | `STANDBY` | `SPEED_CONTROL` | `[d_rel_meas > 80]` |
@@ -269,7 +269,7 @@ This is the decision-making brain of the system — it answers the question: *"W
 | `v_set` | 30 m/s (108 km/h) | Realistic European highway cruising speed. Faster than both vehicles to create meaningful controller behaviour. |
 | `d_set` | 50 m | ISO 15622 time-gap law: `d_set = 5 + 2.5 × v_ego ≈ 50 m` at following speed ~18 m/s. Becomes dynamic in Phase 4. |
 
-> 📝 **Note on unused inputs:** `delta_v_meas` and `v_ego` are declared but currently unused in the Stateflow transition logic. They are reserved for Phase 4 where: `delta_v_meas` will enable combined distance+velocity emergency brake conditions, and `v_ego` will be used for dynamic `d_set` computation and speed error in the PID controller.
+> 📝 **Note on unused inputs:** `delta_v_meas` and `v_ego` are declared but currently unused in the Stateflow transition logic. They are reserved for Phase 4 where `delta_v_meas` will enable combined distance+velocity emergency brake conditions, and `v_ego` will be used for dynamic `d_set` computation and speed error in the PID controller.
 
 ### Validation
 
@@ -283,6 +283,185 @@ This is the decision-making brain of the system — it answers the question: *"W
 | `ACC_enable` | 1 | ACC switched ON |
 
 **Expected `ACC_mode` sequence:** `0 → 1 → 3` (OFF → STANDBY → FOLLOW_MODE) ✅
+
+
+---
+
+## Phase 4 — ACC PID Controller (`ACC_PID_Controller.slx`)
+
+### Purpose
+
+Implements the **longitudinal control law** of the ACC system. Receives the current ACC mode from the state machine (Phase 3) and sensor measurements (Phase 2), then computes an acceleration demand (`a_demand`) sent to the vehicle plant (Phase 1) via a Unit Delay.
+
+The controller uses two independent PID loops — one for speed regulation and one for gap regulation — selected by a Multiport Switch based on the active ACC mode.
+
+### Subsystem Interface
+
+#### Inputs
+
+| Port | Signal | Unit | Source |
+|------|--------|------|--------|
+| 1 | `ACC_mode` | — | `ACC_Controller` (Phase 3) |
+| 2 | `v_ego_meas` | m/s | `ACC_Sensor` (Phase 2) |
+| 3 | `d_rel_meas` | m | `ACC_Sensor` (Phase 2) |
+| 4 | `v_set` | m/s | `ACC_Controller` (driver setpoint) |
+| 5 | `d_set` | m | `ACC_Controller` (driver setpoint) |
+
+#### Output
+
+| Port | Signal | Unit | Destination |
+|------|--------|------|-------------|
+| 1 | `a_demand` | m/s² | Unit Delay → `ACC_Plant` (Phase 1) |
+
+### Internal Architecture
+
+#### Error Computation
+
+Two Subtract blocks compute the control errors before feeding into the respective PID blocks:
+
+\[ e_{speed} = v_{set} - v_{ego\_meas} \]
+
+\[ e_{dist} = d_{rel\_meas} - d_{set} \]
+
+A positive `e_speed` means the ego car is too slow — the controller accelerates. A positive `e_dist` means the gap is larger than desired — the controller accelerates to close it. A negative `e_dist` means the gap is too small — the controller brakes.
+
+#### PID_speed — Speed Control (ACC_mode = 2)
+
+Active when no lead vehicle is present or the gap is large. Regulates ego speed to `v_set`.
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Kp | 0.3 | Moderate proportional gain — avoids aggressive throttle surges |
+| Ki | 0.05 | Slow integral — eliminates steady-state speed error without overshoot |
+| Kd | 0 | Derivative disabled — speed changes smoothly; D would amplify noise |
+| Output min | −3 m/s² | Comfortable deceleration limit |
+| Output max | +1.5 m/s² | Comfortable acceleration limit |
+
+#### PID_dist — Distance Control (ACC_mode = 3)
+
+Active when a lead vehicle is detected within range. Regulates gap to `d_set`.
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Kp | 0.05 | Conservative gain — gap regulation requires slow, stable response |
+| Ki | 0.005 | Very slow integral — avoids integral windup during gap transients |
+| Kd | 0 | Derivative disabled — `d_rel_meas` carries radar noise; D would amplify it directly |
+| Output min | −3 m/s² | Comfortable deceleration limit |
+| Output max | +1.5 m/s² | Comfortable acceleration limit |
+
+> ⚠️ **Note on Kd:** Setting Kd = 0 for `PID_dist` was essential. With noisy radar measurement `d_rel_meas`, a non-zero Kd caused high-frequency oscillations of ±4 m/s² in `a_demand`. This is a known issue in sensor-in-the-loop PID design: the derivative of a noisy signal amplifies noise by a factor proportional to frequency.
+
+#### Multiport Switch — Mode Selection
+
+A Multiport Switch (zero-based indexing) selects the active control output based on `ACC_mode`:
+
+| Port | ACC_mode | State | a_demand source |
+|------|----------|-------|-----------------|
+| 0 | 0 | OFF | Constant = 0 m/s² |
+| 1 | 1 | STANDBY | Constant = 0 m/s² |
+| 2 | 2 | SPEED CONTROL | PID_speed output |
+| 3 | 3 | FOLLOW | PID_dist output |
+| 4 | 4 | EMERGENCY BRAKE | Constant = −8 m/s² |
+
+Only one PID is active at any time. The switch ensures clean mode transitions with no blending.
+
+### Integration in ACC_System
+
+#### Algebraic Loop Resolution
+
+Connecting `ACC_PID_Controller` output directly to `ACC_Plant` input created an algebraic loop:
+
+```
+ACC_Plant → ACC_Sensor → ACC_Controller → ACC_PID_Controller → ACC_Plant
+```
+
+Each block requires the previous block's output at the same time instant — Simulink cannot solve this circular dependency simultaneously.
+
+**Fix:** A **Unit Delay** block was inserted on the `a_demand` wire between `ACC_PID_Controller` and `ACC_Plant`:
+
+| Parameter | Value |
+|-----------|-------|
+| Initial condition | 0 m/s² |
+| Sample time | 0.01 s |
+
+This introduces a one-step (10 ms) delay — negligible for vehicle dynamics at this timescale — which breaks the loop and allows sequential block evaluation.
+
+#### Signal Routing (ACC_System.slx)
+
+| From | Signal | To |
+|------|--------|----|
+| `ACC_Sensor` | `v_ego_meas` | `ACC_PID_Controller` port 2 |
+| `ACC_Sensor` | `d_rel_meas` | `ACC_PID_Controller` port 3 |
+| `ACC_Controller` | `ACC_mode` | `ACC_PID_Controller` port 1 |
+| `ACC_Controller` | `v_set` | `ACC_PID_Controller` port 4 |
+| `ACC_Controller` | `d_set` | `ACC_PID_Controller` port 5 |
+| `ACC_PID_Controller` | `a_demand` | Unit Delay → `ACC_Plant` |
+
+### Simulation Results
+
+**Simulation parameters:** t = 0–30 s, fixed-step ode4, step size = 0.01 s  
+**Initial conditions:** v_ego = 20 m/s, v_lead = 15 m/s, d_rel = 50 m, d_set = 30 m, v_set = 30 m/s
+
+#### ACC_mode
+
+Remained steady at **3 (FOLLOW_MODE)** throughout the simulation. This is correct: since `v_ego = 20 m/s > v_lead = 15 m/s` from t = 0, the gap is always closing and FOLLOW_MODE is immediately active. SPEED_CONTROL would only activate if the lead car were faster than or equal to the ego car.
+
+#### a_demand (Scope3)
+
+| Time | Value | Event |
+|------|-------|-------|
+| t = 0–5 s | 0 → −2 m/s² | PID_dist braking — gap closing at 5 m/s |
+| t = 5–12 s | −2 → +1.5 m/s² | Gap stabilising, PID transitions to accelerate |
+| t = 12–20 s | +1.5 m/s² (saturated) | Holding max acceleration to maintain gap |
+| t ≈ 24 s | −8 m/s² (step) | Emergency brake triggered — d_rel dropped below 10 m |
+| t = 25–30 s | −4 → recovering | Gap reopening after emergency brake |
+
+#### d_rel (Scope5)
+
+| Time | Value | Event |
+|------|-------|-------|
+| t = 0 s | 50 m | Initial gap |
+| t = 0–5 s | 50 → 35 m | Closing at 5 m/s (ego faster than lead) |
+| t = 5–15 s | 35 → 79 m | PID over-braked, gap grew beyond d_set |
+| t = 15–25 s | 79 → 8 m | PID accelerated to close gap, overshot |
+| t ≈ 25 s | ~8 m | Emergency brake threshold reached |
+| t = 25–30 s | 8 → 70 m | Gap opens under −8 m/s² braking |
+
+### Key Observations
+
+- **Emergency brake trigger confirmed:** State machine correctly transitioned to mode 4 at t ≈ 24 s when `d_rel` dropped to ~8 m, producing a clean −8 m/s² step in `a_demand`. ✅
+- **PID response verified:** Both PID blocks produced non-zero output, confirming correct wiring and gain configuration. ✅
+- **Output saturation working:** `a_demand` correctly clamped at +1.5 m/s² and −3 m/s² during normal operation, and at −8 m/s² during emergency brake. ✅
+- **Oscillation observed:** `d_rel` oscillated between 8 m and 79 m instead of settling at d_set = 30 m. Root cause: PID gains still too large relative to plant dynamics. Addressed in Phase 5. ⚠️
+
+### Assumptions and Simplifications
+
+- `v_set` and `d_set` are constant outputs from `ACC_Controller` (held fixed for Phase 4 testing)
+- No feedforward term — pure feedback PID only
+- No anti-windup mechanism (planned for Phase 5 tuning)
+- Unit Delay sample time matches solver step size (0.01 s)
+
+### Known Issues → Phase 5
+
+| Issue | Root Cause | Phase 5 Fix |
+|-------|------------|-------------|
+| d_rel oscillates (8–79 m) | PID gains too large relative to plant dynamics | Systematic gain reduction: Kp first, then Ki |
+| Gap never settles at d_set = 30 m | Integral windup combined with output saturation | Reduce Ki; consider anti-windup clamping |
+
+---
+
+## How to Run (Updated)
+
+### Phase 4 (Full integrated system)
+1. Open `ACC_System.slx`
+2. Ensure Unit Delay is inserted on `a_demand` wire (initial condition = 0)
+3. Verify `ACC_enable = 1` constant block is connected
+4. Add Scopes to: `ACC_mode`, `a_demand`, `d_rel`, `v_ego`
+5. Run (Ctrl+T) — verify:
+   - `ACC_mode` = 3 (FOLLOW_MODE) for this scenario ✅
+   - `a_demand` responds with braking then acceleration ✅
+   - `d_rel` decreases from 50 m and system reacts ✅
+   - Emergency brake (−8 m/s²) triggers when d_rel < 10 m ✅
 
 ---
 
@@ -305,6 +484,17 @@ This is the decision-making brain of the system — it answers the question: *"W
 2. Test constants already wired: `d_rel_meas=45`, `delta_v_meas=-5`, `v_ego=30`, `ACC_enable=1`
 3. Add Scope to `ACC_mode`
 4. Run — verify `ACC_mode` settles at 3 (FOLLOW_MODE) ✅
+
+### Phase 4 (Full integrated system)
+1. Open `ACC_System.slx`
+2. Ensure Unit Delay is inserted on `a_demand` wire (initial condition = 0)
+3. Verify `ACC_enable = 1` constant block is connected
+4. Add Scopes to: `ACC_mode`, `a_demand`, `d_rel`, `v_ego`
+5. Run (Ctrl+T) — verify:
+   - `ACC_mode` = 3 (FOLLOW_MODE) for this scenario ✅
+   - `a_demand` responds with braking then acceleration ✅
+   - `d_rel` decreases from 50 m and system reacts ✅
+   - Emergency brake (−8 m/s²) triggers when d_rel < 10 m ✅
 
 ---
 
